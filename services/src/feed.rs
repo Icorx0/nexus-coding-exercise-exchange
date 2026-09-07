@@ -150,6 +150,28 @@ impl FeedState {
             num_accounts: num_accounts.max(1),
         }
     }
+
+    /// Remembers an order as a target a future random cancel may pick, keeping
+    /// the pool capped at the most recent `CANCEL_CANDIDATE_WINDOW` orders.
+    pub fn push_cancel_candidate(&mut self, id: OrderId, account: AccountId) {
+        self.cancel_candidates.push((id, account));
+        if self.cancel_candidates.len() > CANCEL_CANDIDATE_WINDOW {
+            self.cancel_candidates.remove(0);
+        }
+    }
+
+    /// Drops an order from the pool. The engine calls this when an order
+    /// leaves the book because it filled, so the generator stops offering
+    /// cancels for orders that no longer exist.
+    pub fn remove_cancel_candidate(&mut self, id: OrderId) {
+        self.cancel_candidates
+            .retain(|(candidate, _)| *candidate != id);
+    }
+
+    /// The orders currently eligible to be picked as a random cancel target.
+    pub fn cancel_candidates(&self) -> &[(OrderId, AccountId)] {
+        &self.cancel_candidates
+    }
 }
 
 /// Returns the current UNIX timestamp in milliseconds.
@@ -185,7 +207,7 @@ async fn produce_orders(state: Arc<Mutex<FeedState>>, engine: Arc<Mutex<Engine>>
             let mut state = state.lock().unwrap();
             let msg = generate_message(&mut state);
             state.messages.push(msg.clone());
-            engine.lock().unwrap().ingest(&msg);
+            engine.lock().unwrap().ingest(&msg, &mut state);
             msg
         };
 
@@ -231,10 +253,7 @@ fn generate_message(state: &mut FeedState) -> OrderMessage {
     let account = rng.gen_range(0..state.num_accounts);
 
     // Remember this order as a potential cancel target.
-    state.cancel_candidates.push((id, account));
-    if state.cancel_candidates.len() > CANCEL_CANDIDATE_WINDOW {
-        state.cancel_candidates.remove(0);
-    }
+    state.push_cancel_candidate(id, account);
 
     OrderMessage::New {
         id,
@@ -369,7 +388,7 @@ async fn submit_order(
             quantity: req.quantity,
         };
         state.messages.push(msg.clone());
-        engine.lock().unwrap().ingest(&msg);
+        engine.lock().unwrap().ingest(&msg, &mut state);
         msg
     };
 
