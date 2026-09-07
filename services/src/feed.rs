@@ -1,6 +1,7 @@
+use crate::engine::Engine;
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{FromRef, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -44,14 +45,19 @@ pub async fn start_feed(num_accounts: u32, rate: f64) {
     // The feed state is created and wrapped in a thread-safe smart pointer.
     let shared_state = Arc::new(Mutex::new(FeedState::new(num_accounts)));
 
+    // The order book we build from the feed is shared the same way, so the
+    // generator task and the API handlers both write into it.
+    let engine = Arc::new(Mutex::new(Engine::new()));
+
     // The order generator runs in a separate asynchronous task.
     let generator_state = Arc::clone(&shared_state);
+    let generator_engine = Arc::clone(&engine);
     tokio::spawn(async move {
-        produce_orders(generator_state, rate).await;
+        produce_orders(generator_state, generator_engine, rate).await;
     });
 
     // The API server is started to handle incoming requests.
-    run_server(shared_state).await;
+    run_server(shared_state, engine).await;
 }
 
 /// Represents the side of an order in the market.
@@ -164,15 +170,24 @@ fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
 
-/// A loop that publishes a new random message on the feed at a fixed rate.
-async fn produce_orders(state: Arc<Mutex<FeedState>>, rate: f64) {
+/// A loop that publishes a new random message on the feed at a fixed rate and
+/// records it in the order book.
+async fn produce_orders(state: Arc<Mutex<FeedState>>, engine: Arc<Mutex<Engine>>, rate: f64) {
     let interval_ms = (1000.0 / rate.clamp(0.1, 1000.0)) as u64;
     loop {
         sleep(Duration::from_millis(interval_ms)).await;
-        let mut state = state.lock().unwrap();
-        let msg = generate_message(&mut state);
+
+        // The feed lock is released before the engine lock is taken, so the
+        // two are never held at once and the writers cannot deadlock.
+        let msg = {
+            let mut state = state.lock().unwrap();
+            let msg = generate_message(&mut state);
+            state.messages.push(msg.clone());
+            msg
+        };
+
         info!("Publishing message: {:?}", msg);
-        state.messages.push(msg);
+        engine.lock().unwrap().ingest(&msg);
     }
 }
 
@@ -206,7 +221,11 @@ fn generate_message(state: &mut FeedState) -> OrderMessage {
     // frequently cross each other.
     let price = round2(*mid * (1.0 + rng.gen_range(-0.005..0.005)));
     let quantity = round1(rng.gen_range(1.0..10.0));
-    let side = if rng.gen_bool(0.5) { Side::Buy } else { Side::Sell };
+    let side = if rng.gen_bool(0.5) {
+        Side::Buy
+    } else {
+        Side::Sell
+    };
     let account = rng.gen_range(0..state.num_accounts);
 
     // Remember this order as a potential cancel target.
@@ -226,15 +245,40 @@ fn generate_message(state: &mut FeedState) -> OrderMessage {
     }
 }
 
+/// The state shared with every request handler.
+///
+/// Handlers pull out only the piece they need through the `FromRef` impls
+/// below, so a handler that just touches the feed keeps its original signature.
+#[derive(Clone)]
+struct AppState {
+    feed: Arc<Mutex<FeedState>>,
+    engine: Arc<Mutex<Engine>>,
+}
+
+impl FromRef<AppState> for Arc<Mutex<FeedState>> {
+    fn from_ref(app: &AppState) -> Self {
+        Arc::clone(&app.feed)
+    }
+}
+
+impl FromRef<AppState> for Arc<Mutex<Engine>> {
+    fn from_ref(app: &AppState) -> Self {
+        Arc::clone(&app.engine)
+    }
+}
+
 /// Runs the API server to handle HTTP requests.
 /// The server serves the order feed and accepts order submissions.
-async fn run_server(shared_state: Arc<Mutex<FeedState>>) {
+async fn run_server(shared_state: Arc<Mutex<FeedState>>, engine: Arc<Mutex<Engine>>) {
     let app = Router::new()
         .route("/orders", get(get_orders))
         .route("/order", post(submit_order))
         .route("/cancel", post(submit_cancel))
         .route("/symbols", get(get_symbols))
-        .with_state(shared_state);
+        .with_state(AppState {
+            feed: shared_state,
+            engine,
+        });
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     info!("listening on {}", addr);
@@ -287,10 +331,11 @@ struct SubmitResponse {
 }
 
 /// Handles POST requests for submitting a new order onto the feed.
-/// The order is validated, assigned an ID, and published like any other
-/// feed message.
+/// The order is validated, assigned an ID, published like any other feed
+/// message, and recorded in the order book.
 async fn submit_order(
     State(state): State<Arc<Mutex<FeedState>>>,
+    State(engine): State<Arc<Mutex<Engine>>>,
     Json(req): Json<SubmitOrderRequest>,
 ) -> Result<Json<SubmitResponse>, (StatusCode, String)> {
     if !SYMBOLS.iter().any(|(s, _)| *s == req.symbol) {
@@ -306,21 +351,27 @@ async fn submit_order(
         ));
     }
 
-    let mut state = state.lock().unwrap();
-    let id = state.next_id;
-    state.next_id += 1;
-    let msg = OrderMessage::New {
-        id,
-        timestamp: now_millis(),
-        account: req.account,
-        symbol: req.symbol,
-        side: req.side,
-        price: req.price,
-        quantity: req.quantity,
+    // As in the generator, the feed lock is dropped before the engine lock.
+    let msg = {
+        let mut state = state.lock().unwrap();
+        let id = state.next_id;
+        state.next_id += 1;
+        let msg = OrderMessage::New {
+            id,
+            timestamp: now_millis(),
+            account: req.account,
+            symbol: req.symbol,
+            side: req.side,
+            price: req.price,
+            quantity: req.quantity,
+        };
+        state.messages.push(msg.clone());
+        msg
     };
+
     info!("Received order: {:?}", msg);
-    state.messages.push(msg);
-    Ok(Json(SubmitResponse { id }))
+    engine.lock().unwrap().ingest(&msg);
+    Ok(Json(SubmitResponse { id: msg.id() }))
 }
 
 /// Defines the request body for submitting a cancel.
