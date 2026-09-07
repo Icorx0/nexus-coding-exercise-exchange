@@ -177,17 +177,19 @@ async fn produce_orders(state: Arc<Mutex<FeedState>>, engine: Arc<Mutex<Engine>>
     loop {
         sleep(Duration::from_millis(interval_ms)).await;
 
-        // The feed lock is released before the engine lock is taken, so the
-        // two are never held at once and the writers cannot deadlock.
+        // The engine lock is taken while the feed lock is still held, so the
+        // book never lags the published feed. Both writers acquire the two in
+        // this order -- feed, then engine -- and nothing acquires them the
+        // other way round, so they cannot deadlock.
         let msg = {
             let mut state = state.lock().unwrap();
             let msg = generate_message(&mut state);
             state.messages.push(msg.clone());
+            engine.lock().unwrap().ingest(&msg);
             msg
         };
 
         info!("Publishing message: {:?}", msg);
-        engine.lock().unwrap().ingest(&msg);
     }
 }
 
@@ -351,7 +353,8 @@ async fn submit_order(
         ));
     }
 
-    // As in the generator, the feed lock is dropped before the engine lock.
+    // As in the generator, the engine lock is taken while the feed lock is
+    // held, and always in that order.
     let msg = {
         let mut state = state.lock().unwrap();
         let id = state.next_id;
@@ -366,11 +369,11 @@ async fn submit_order(
             quantity: req.quantity,
         };
         state.messages.push(msg.clone());
+        engine.lock().unwrap().ingest(&msg);
         msg
     };
 
     info!("Received order: {:?}", msg);
-    engine.lock().unwrap().ingest(&msg);
     Ok(Json(SubmitResponse { id: msg.id() }))
 }
 
